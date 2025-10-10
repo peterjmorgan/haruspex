@@ -27,7 +27,7 @@ fn main() -> anyhow::Result<()> {
     }
 
     // Run haruspex and check the number of decompiled functions
-    let n_decomp = haruspex::run(Path::new(FILENAME))?;
+    let n_decomp = haruspex::run(Path::new(FILENAME), false)?;
     println!();
     print!("[*] Checking number of decompiled functions... ");
     assert_eq!(n_decomp, N_DECOMP, "wrong number of decompiled functions");

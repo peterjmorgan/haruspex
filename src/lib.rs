@@ -111,7 +111,7 @@ use anyhow::Context;
 use idalib::IDAError;
 use idalib::decompiler::HexRaysErrorCode;
 use idalib::func::{Function, FunctionFlags};
-use idalib::idb::IDB;
+use idalib::idb::{IDB, IDBOpenOptions};
 use thiserror::Error;
 
 /// Number of decompiled functions
@@ -137,17 +137,172 @@ pub enum HaruspexError {
     FileWriteFailed(#[from] std::io::Error),
 }
 
+/// Open an IDA database, either from an existing .i64/.idb file or by analyzing a binary.
+///
+/// ## Errors
+///
+/// Returns an error if the file cannot be opened or analyzed.
+fn open_database(filepath: &Path, load_existing: bool) -> anyhow::Result<IDB> {
+    let is_database = filepath
+        .extension()
+        .is_some_and(|ext| ext == "i64" || ext == "idb" || ext == "i32");
+
+    if is_database {
+        println!("[*] Opening existing IDA database `{}`", filepath.display());
+        IDBOpenOptions::new()
+            .auto_analyse(false)
+            .open(filepath)
+            .with_context(|| format!("Failed to open IDA database `{}`", filepath.display()))
+    } else if load_existing {
+        let idb_path = filepath.with_extension("i64");
+        if idb_path.exists() {
+            println!("[*] Loading existing IDA database `{}`", idb_path.display());
+            IDBOpenOptions::new()
+                .auto_analyse(false)
+                .open(&idb_path)
+                .with_context(|| {
+                    format!(
+                        "Failed to open existing IDA database `{}`",
+                        idb_path.display()
+                    )
+                })
+        } else {
+            println!(
+                "[*] No existing database found, analyzing binary file `{}`",
+                filepath.display()
+            );
+            println!("[*] Database will be saved to `{}`", idb_path.display());
+            IDBOpenOptions::new()
+                .idb(&idb_path)
+                .save(true)
+                .open(filepath)
+                .with_context(|| format!("Failed to analyze binary file `{}`", filepath.display()))
+        }
+    } else {
+        println!("[*] Analyzing binary file `{}`", filepath.display());
+        IDB::open(filepath)
+            .with_context(|| format!("Failed to analyze binary file `{}`", filepath.display()))
+    }
+}
+
+/// Generate output file path for a decompiled function.
+fn generate_output_path(dirpath: &Path, func: &Function) -> std::path::PathBuf {
+    let func_name = func.name().unwrap_or_else(|| "<no name>".into());
+    let output_file = format!(
+        "{}@{:X}",
+        func_name
+            .replace(RESERVED_CHARS, "_")
+            .chars()
+            .take(MAX_FILENAME_LEN)
+            .collect::<String>(),
+        func.start_address()
+    );
+    dirpath.join(output_file).with_extension("c")
+}
+
+/// List all functions in the database with their names and addresses.
+///
+/// ## Errors
+///
+/// Returns an error if the database cannot be opened.
+pub fn list_functions(filepath: &Path, load_existing: bool) -> anyhow::Result<()> {
+    let idb = open_database(filepath, load_existing)?;
+    println!("[+] Successfully opened database");
+    println!();
+
+    println!("[-] Processor: {}", idb.processor().long_name());
+    println!("[-] Compiler: {:?}", idb.meta().cc_id());
+    println!("[-] File type: {:?}", idb.meta().filetype());
+    println!();
+
+    println!("[*] Functions in database:");
+    println!();
+    println!("{:<18} Name", "Address");
+    println!("{}", "-".repeat(80));
+
+    for (_id, f) in idb.functions() {
+        if f.flags().contains(FunctionFlags::THUNK) {
+            continue;
+        }
+
+        let func_name = f.name().unwrap_or_else(|| "<no name>".into());
+        println!("0x{:016X} {}", f.start_address(), func_name);
+    }
+
+    println!();
+    println!("[+] Total functions: {}", idb.function_count());
+    Ok(())
+}
+
+/// Decompile a single function and write its pseudocode to a file.
+///
+/// ## Errors
+///
+/// Returns an error if the function cannot be found or decompiled.
+pub fn run_single_function(
+    filepath: &Path,
+    load_existing: bool,
+    function_spec: &str,
+    output_path: Option<&Path>,
+) -> anyhow::Result<()> {
+    let idb = open_database(filepath, load_existing)?;
+    println!("[+] Successfully opened database");
+    println!();
+
+    println!("[-] Processor: {}", idb.processor().long_name());
+    println!("[-] Compiler: {:?}", idb.meta().cc_id());
+    println!("[-] File type: {:?}", idb.meta().filetype());
+    println!();
+
+    if !idb.decompiler_available() {
+        return Err(anyhow::anyhow!("Decompiler is not available"));
+    }
+
+    let func = if let Some(addr_str) = function_spec.strip_prefix("0x") {
+        let addr = u64::from_str_radix(addr_str, 16)
+            .with_context(|| format!("Invalid hex address: {function_spec}"))?;
+        idb.function_at(addr)
+            .ok_or_else(|| anyhow::anyhow!("No function found at address {function_spec}"))?
+    } else {
+        idb.functions()
+            .find(|(_, f)| f.name().is_some_and(|n| n == function_spec))
+            .map(|(_, f)| f)
+            .ok_or_else(|| anyhow::anyhow!("Function '{function_spec}' not found"))?
+    };
+
+    let func_name = func.name().unwrap_or_else(|| "<no name>".into());
+    println!(
+        "[*] Decompiling function '{}' at 0x{:X}",
+        func_name,
+        func.start_address()
+    );
+
+    let output_file = output_path.map_or_else(
+        || {
+            let base_name = filepath.file_stem().unwrap_or_default();
+            let output_name = format!(
+                "{}_{}.c",
+                base_name.to_string_lossy(),
+                func_name.replace(RESERVED_CHARS, "_")
+            );
+            std::path::PathBuf::from(output_name)
+        },
+        std::path::Path::to_path_buf,
+    );
+
+    decompile_to_file(&idb, &func, &output_file)?;
+    println!("[+] Decompiled to `{}`", output_file.display());
+    Ok(())
+}
+
 /// Extract pseudocode of functions in the binary file at `filepath` and save it in `filepath.dec`.
 ///
 /// ## Errors
 ///
 /// Returns how many functions were decompiled, or a generic error in case something goes wrong.
-pub fn run(filepath: &Path) -> anyhow::Result<usize> {
-    // Open the target binary and run auto-analysis
-    println!("[*] Analyzing binary file `{}`", filepath.display());
-    let idb = IDB::open(filepath)
-        .with_context(|| format!("Failed to analyze binary file `{}`", filepath.display()))?;
-    println!("[+] Successfully analyzed binary file");
+pub fn run(filepath: &Path, load_existing: bool) -> anyhow::Result<usize> {
+    let idb = open_database(filepath, load_existing)?;
+    println!("[+] Successfully opened database");
     println!();
 
     // Print binary file information
@@ -181,18 +336,8 @@ pub fn run(filepath: &Path) -> anyhow::Result<usize> {
             continue;
         }
 
-        // Decompile function and write pseudocode to the output file
         let func_name = f.name().unwrap_or_else(|| "<no name>".into());
-        let output_file = format!(
-            "{}@{:X}",
-            func_name
-                .replace(RESERVED_CHARS, "_")
-                .chars()
-                .take(MAX_FILENAME_LEN)
-                .collect::<String>(),
-            f.start_address()
-        );
-        let output_path = dirpath.join(output_file).with_extension("c");
+        let output_path = generate_output_path(&dirpath, &f);
 
         match decompile_to_file(&idb, &f, &output_path) {
             // Print the output path in case of successful function decompilation

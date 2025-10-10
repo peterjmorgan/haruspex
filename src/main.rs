@@ -1,50 +1,82 @@
 //! main.rs
 
-use std::path::Path;
-use std::{env, process};
+use std::path::PathBuf;
+use std::process;
+
+use clap::Parser;
 
 const PROGRAM: &str = env!("CARGO_PKG_NAME");
 const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+#[derive(Parser)]
+#[command(name = PROGRAM)]
+#[command(version = VERSION)]
+#[command(about = "Tool to extract IDA decompiler's pseudocode", long_about = None)]
+struct Cli {
+    #[arg(
+        value_name = "FILE",
+        help = "Binary file or IDA database (.i64/.idb) to analyze"
+    )]
+    input: PathBuf,
+
+    #[arg(
+        short = 'l',
+        long = "list",
+        help = "List all functions with their addresses and names"
+    )]
+    list: bool,
+
+    #[arg(
+        short = 'e',
+        long = "load-existing",
+        help = "Load existing IDA database if available (skips re-analysis)"
+    )]
+    load_existing: bool,
+
+    #[arg(
+        short = 'f',
+        long = "function",
+        value_name = "FUNC",
+        help = "Decompile only the specified function (by name or address like 0x401000)"
+    )]
+    function: Option<String>,
+
+    #[arg(
+        short = 'o',
+        long = "output",
+        value_name = "PATH",
+        help = "Output file path for single function decompilation"
+    )]
+    output: Option<PathBuf>,
+}
 
 fn main() {
     println!("{PROGRAM} {VERSION} - Tool to extract IDA decompiler's pseudocode");
     println!("Copyright (c) 2024-2025 Marco Ivaldi <raptor@0xdeadbeef.info>");
     println!();
 
-    // Force IDA Pro to stay quiet
     idalib::force_batch_mode();
 
-    // Parse command line arguments
-    let args = env::args().collect::<Vec<_>>();
+    let cli = Cli::parse();
 
-    let prog = Path::new(&args[0])
-        .file_name()
-        .unwrap()
-        .to_str()
-        .unwrap_or(PROGRAM);
-
-    let filename = match args.len() {
-        2 => &args[1],
-        _ => "-",
+    let result = if cli.list {
+        haruspex::list_functions(&cli.input, cli.load_existing)
+    } else if let Some(func_spec) = cli.function {
+        haruspex::run_single_function(
+            &cli.input,
+            cli.load_existing,
+            &func_spec,
+            cli.output.as_deref(),
+        )
+    } else {
+        haruspex::run(&cli.input, cli.load_existing).map(|_| ())
     };
-    if filename.starts_with('-') {
-        usage(prog);
-    }
 
-    // Let's do it
-    match haruspex::run(Path::new(filename)) {
-        Ok(_) => (),
+    match result {
+        Ok(()) => (),
         Err(err) => {
             eprintln!("[!] Error: {err:#}");
             process::exit(1);
         }
     }
-}
-
-/// Print usage information and exit
-fn usage(prog: &str) {
-    println!("Usage:");
-    println!("{prog} <binary_file>");
-
-    process::exit(0);
 }
