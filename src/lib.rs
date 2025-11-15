@@ -217,7 +217,7 @@ pub fn list_functions(filepath: &Path, load_existing: bool) -> anyhow::Result<()
 
     println!("[*] Functions in database:");
     println!();
-    println!("{:<18} Name", "Address");
+    println!("{:<18} {:<10} Name", "Address", "Size");
     println!("{}", "-".repeat(80));
 
     for (_id, f) in idb.functions() {
@@ -226,7 +226,7 @@ pub fn list_functions(filepath: &Path, load_existing: bool) -> anyhow::Result<()
         }
 
         let func_name = f.name().unwrap_or_else(|| "<no name>".into());
-        println!("0x{:016X} {}", f.start_address(), func_name);
+        println!("0x{:016X} {:<10} {}", f.start_address(), f.len(), func_name);
     }
 
     println!();
